@@ -1,0 +1,35 @@
+# Секреты — никогда не коммитим
+.env
+
+# Виртуальное окружение
+venv/
+.venv/
+env/
+
+# Кэш Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Логи
+*.log
+
+# Данные, которые создаются во время работы агента
+memory.json
+memory.json.broken
+memory.json.tmp
+reminders.json
+reminders.json.tmp
+workspace/*
+!workspace/.gitkeep
+
+# Настройки IDE
+.vscode/
+.idea/
+
+# Системный мусор Windows/macOS
+Thumbs.db
+.DS_Store
