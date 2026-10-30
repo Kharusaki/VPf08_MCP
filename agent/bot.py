@@ -223,8 +223,15 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
             continue
 
         try:
+            chat_id_int = int(chat_id)
+        except (TypeError, ValueError):
+            logger.warning("Некорректный chat_id в напоминании %s", reminder_id)
+            await asyncio.to_thread(mark_reminder_sent, reminder_id)
+            continue
+
+        try:
             await context.bot.send_message(
-                chat_id=int(chat_id),
+                chat_id=chat_id_int,
                 text=f"Напоминание: {item.get('text')}",
             )
             await asyncio.to_thread(mark_reminder_sent, reminder_id)

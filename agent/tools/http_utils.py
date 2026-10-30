@@ -55,6 +55,13 @@ def request(
                 proxies=_proxy_map() if use_proxy else None,
                 **kwargs,
             )
+            if use_proxy and response.status_code in {403, 407, 502, 503, 504}:
+                logger.warning(
+                    "Прокси вернул HTTP %s для %s, пробую напрямую",
+                    response.status_code,
+                    url,
+                )
+                continue
             return response
         except requests.RequestException as exc:
             last_error = exc
