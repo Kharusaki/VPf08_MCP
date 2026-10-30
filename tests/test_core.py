@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 from agent.config import SETTINGS
 from agent.memory import add_message, clear_history, get_history, get_stats
@@ -117,6 +119,29 @@ class AgentToolsTest(unittest.TestCase):
             run_terminal_command("dir & del file.txt")
         with self.assertRaises(ValueError):
             http_request("http://127.0.0.1/secret")
+
+    def test_telegram_reminder_dispatch(self) -> None:
+        from agent.bot import check_reminders
+
+        class FakeBot:
+            def __init__(self) -> None:
+                self.sent: list[tuple[int, str]] = []
+
+            async def send_message(self, chat_id: int, text: str) -> None:
+                self.sent.append((chat_id, text))
+
+        item = add_reminder(
+            "проверить бота",
+            (_now() - timedelta(minutes=1)).isoformat(),
+            chat_id="12345",
+        )
+        fake_bot = FakeBot()
+        asyncio.run(check_reminders(SimpleNamespace(bot=fake_bot)))
+
+        self.assertEqual(len(fake_bot.sent), 1)
+        self.assertEqual(fake_bot.sent[0][0], 12345)
+        self.assertIn("проверить бота", fake_bot.sent[0][1])
+        self.assertNotIn(item["id"], [x["id"] for x in list_reminders("12345")])
 
 
 if __name__ == "__main__":
