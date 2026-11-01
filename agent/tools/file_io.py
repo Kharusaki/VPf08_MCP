@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from ..config import SETTINGS
+from .docx_reader import extract_docx_text
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,9 @@ def read_file(path: str, max_bytes: int | None = None) -> str:
         raise IsADirectoryError(f"Это не файл: {_relative(target)}")
 
     limit = max_bytes or SETTINGS.max_read_bytes
+    if target.suffix.lower() == ".docx":
+        return extract_docx_text(target, max_chars=limit)
+
     size = target.stat().st_size
     if size > limit:
         raise ValueError(

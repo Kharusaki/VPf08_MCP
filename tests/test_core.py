@@ -9,12 +9,18 @@ from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+import agent.tools.crypto as crypto_tool
+import agent.tools.currency as currency_tool
+from agent.agent import Agent
 from agent.config import SETTINGS
 from agent.memory import add_message, clear_history, get_history, get_stats
 from agent.tools.calculator import calculate
 from agent.tools.file_io import list_directory, read_file, write_file
 from agent.tools.http_request import http_request
-from agent.tools.registry import execute_tool
+from agent.tools.page_reader import extract_text
+from agent.tools.registry import TOOL_SPECS, execute_tool
+from agent.tools.search import _parse_date
+from agent.tools.time_utils import format_times
 from agent.tools.reminders import (
     _now,
     add_reminder,
@@ -63,6 +69,113 @@ class AgentToolsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             calculate("__import__('os').system('dir')")
 
+    def test_page_text_extraction(self) -> None:
+        html = """
+        <html>
+          <head>
+            <title>Новости за 31 октября</title>
+            <style>.hidden { color: red; }</style>
+          </head>
+          <body>
+            <script>alert('не текст');</script>
+            <h1>Польша</h1>
+            <p>В Варшаве протесты у Конституционного суда.</p>
+          </body>
+        </html>
+        """
+        title, text = extract_text(html)
+        self.assertIn("Новости", title)
+        self.assertIn("Польша", text)
+        self.assertIn("протесты", text)
+        self.assertNotIn("alert", text)
+        self.assertNotIn("color", text)
+
+    def test_news_intent_forces_search(self) -> None:
+        self.assertTrue(Agent._needs_web_search("Найди новости о 3 ключевых событиях"))
+        self.assertTrue(Agent._needs_web_search("найди в duckduckgo новости мира"))
+        self.assertTrue(Agent._needs_web_search("Что произошло в мире сегодня?"))
+        self.assertTrue(
+            Agent._needs_web_search(
+                "Найди 3 ключевых события в мире за 31.10.2026, которые произошли вчера"
+            )
+        )
+        self.assertFalse(Agent._needs_web_search("Посчитай (2+3)*sqrt(16)"))
+        self.assertFalse(Agent._needs_web_search("Прочитай notes.txt"))
+
+    def test_news_date_parsing(self) -> None:
+        self.assertEqual(str(_parse_date("31.10.2026")), "2026-10-31")
+        self.assertEqual(str(_parse_date("world news October 31 2026")), "2026-10-31")
+        self.assertEqual(str(_parse_date("31 октября 2026")), "2026-10-31")
+
+    def test_timezone_clarification(self) -> None:
+        self.assertTrue(Agent._needs_timezone("Покажи курс BTC к RUB"))
+        self.assertTrue(Agent._needs_timezone("Который час?"))
+        self.assertFalse(Agent._needs_timezone("Покажи курс BTC к RUB в МСК"))
+        self.assertFalse(Agent._needs_timezone("Который час в UTC?"))
+        self.assertFalse(Agent._needs_timezone("Посчитай (2+3)*sqrt(16)"))
+
+        history = [
+            {"role": "user", "content": "Покажи курс BTC к RUB"},
+            {"role": "assistant", "content": "В каком часовом поясе показать время?"},
+        ]
+        self.assertTrue(Agent._is_timezone_answer("МСК", history))
+        self.assertFalse(Agent._is_timezone_answer("Курс BTC в МСК", history))
+
+        agent = Agent.__new__(Agent)
+        reply = agent.run("Покажи курс BTC к RUB", chat_id="test-timezone")
+        self.assertIn("часовом поясе", reply.text)
+        clear_history("test-timezone")
+
+    def test_time_formatting(self) -> None:
+        times = format_times("2026-10-31T22:48:00+00:00")
+        self.assertEqual(times["utc"], "31.10.2026 22:48 UTC")
+        self.assertEqual(times["msk"], "01.11.2026 01:48 МСК")
+
+    def test_crypto_quote_fallback(self) -> None:
+        original = (
+            crypto_tool._coingecko,
+            crypto_tool._coinbase,
+            crypto_tool._blockchain_info,
+        )
+
+        def fail(*args, **kwargs):
+            raise RuntimeError("429")
+
+        crypto_tool._coingecko = fail
+        crypto_tool._coinbase = lambda coin_id, currency: crypto_tool._quote(
+            coin_id, currency, 123.0, "Coinbase", "https://coinbase.com"
+        )
+        crypto_tool._blockchain_info = fail
+        try:
+            quote = crypto_tool.get_crypto_quote("btc", "rub")
+        finally:
+            (
+                crypto_tool._coingecko,
+                crypto_tool._coinbase,
+                crypto_tool._blockchain_info,
+            ) = original
+
+        self.assertEqual(quote["source"], "Coinbase")
+        self.assertEqual(quote["price"], 123.0)
+        self.assertIn("fetched_at", quote)
+        self.assertIn("fetched_at_msk", quote)
+
+    def test_currency_quote_metadata(self) -> None:
+        original = currency_tool.get_json
+        currency_tool.get_json = lambda *args, **kwargs: {
+            "result": "success",
+            "rates": {"RUB": 80.5},
+            "time_last_update_utc": "Sat, 31 Oct 2026 00:00:00 +0000",
+        }
+        try:
+            quote = currency_tool.get_currency_quote("USD", "RUB")
+        finally:
+            currency_tool.get_json = original
+
+        self.assertEqual(quote["rate"], 80.5)
+        self.assertEqual(quote["source"], "open.er-api.com")
+        self.assertIn("fetched_at", quote)
+
     def test_file_sandbox(self) -> None:
         relative = write_file("notes/test.txt", "привет")
         self.assertEqual(Path(relative), Path("notes/test.txt"))
@@ -99,6 +212,9 @@ class AgentToolsTest(unittest.TestCase):
         self.assertFalse(any(x["id"] == item["id"] for x in get_due_reminders(_now() + timedelta(minutes=3))))
 
     def test_qr_and_registry(self) -> None:
+        tool_names = [item["function"]["name"] for item in TOOL_SPECS]
+        self.assertIn("read_url", tool_names)
+
         result = execute_tool("generate_qr", {"text": "https://example.com"})
         self.assertTrue(result["ok"])
         self.assertTrue(result["artifacts"])

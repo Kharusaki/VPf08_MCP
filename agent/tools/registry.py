@@ -18,6 +18,7 @@ from . import (
     currency,
     file_io,
     http_request,
+    page_reader,
     qr,
     reminders,
     search,
@@ -28,6 +29,11 @@ from . import (
 logger = logging.getLogger(__name__)
 
 Handler = Callable[[Dict[str, Any], Dict[str, Any]], Any]
+
+# Инструменты, чей результат намеренно большой (текст файла целиком).
+# Для них агент использует повышенный лимит max_file_result_chars,
+# иначе содержимое документа обрезалось бы до общих 6000 символов.
+BULK_RESULT_TOOLS = {"read_file", "read_table", "read_url"}
 
 
 def _chat_id(context: Dict[str, Any]) -> str:
@@ -42,28 +48,20 @@ def _weather(args: Dict[str, Any], context: Dict[str, Any]) -> Any:
 
 
 def _crypto(args: Dict[str, Any], context: Dict[str, Any]) -> Any:
-    coin = args["coin"]
-    currency_code = args.get("currency", "usd")
-    price = crypto.get_crypto_price(coin, currency_code)
+    quote = crypto.get_crypto_quote(args["coin"], args.get("currency", "usd"))
     return {
-        "coin": coin,
-        "currency": currency_code.upper(),
-        "price": price,
-        "formatted": f"{price:,.2f} {currency_code.upper()}",
+        **quote,
+        "formatted": f"{quote['price']:,.2f} {quote['currency']}",
     }
 
 
 def _currency(args: Dict[str, Any], context: Dict[str, Any]) -> Any:
-    base = args["base"]
-    target = args["target"]
     amount = float(args.get("amount", 1))
-    rate = currency.get_currency_rate(base, target)
+    quote = currency.get_currency_quote(args["base"], args["target"])
     return {
-        "base": base.upper(),
-        "target": target.upper(),
-        "rate": rate,
+        **quote,
         "amount": amount,
-        "converted": amount * rate,
+        "converted": amount * quote["rate"],
     }
 
 
@@ -84,6 +82,10 @@ def _http(args: Dict[str, Any], context: Dict[str, Any]) -> Any:
         json_body=args.get("json_body"),
         timeout=int(args.get("timeout", 20)),
     )
+
+
+def _read_url(args: Dict[str, Any], context: Dict[str, Any]) -> Any:
+    return page_reader.read_url(args["url"], max_chars=int(args.get("max_chars", 4000)))
 
 
 def _read_file(args: Dict[str, Any], context: Dict[str, Any]) -> Any:
@@ -138,6 +140,7 @@ HANDLERS: Dict[str, Handler] = {
     "get_currency_rate": _currency,
     "web_search": _search,
     "http_request": _http,
+    "read_url": _read_url,
     "read_file": _read_file,
     "write_file": _write_file,
     "list_directory": _list_dir,
@@ -157,11 +160,19 @@ TOOL_SPECS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": "Найти актуальную информацию в интернете через DuckDuckGo.",
+            "description": (
+                "Найти актуальную информацию в интернете через DuckDuckGo. "
+                "Для новостей указывай дату и используй английские ключевые слова "
+                "(например, 'Poland coup October 31 2026'). После поиска открой "
+                "1-3 релевантные ссылки через read_url."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Поисковый запрос."},
+                    "query": {
+                        "type": "string",
+                        "description": "Поисковый запрос. Для мировых новостей лучше английские ключевые слова.",
+                    },
                     "max_results": {"type": "integer", "description": "Сколько результатов вернуть (1-10).", "default": 5},
                     "region": {"type": "string", "description": "Регион поиска, например ru-ru.", "default": "ru-ru"},
                 },
@@ -187,7 +198,10 @@ TOOL_SPECS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "get_crypto_price",
-            "description": "Узнать текущий курс криптовалюты (Bitcoin, Ethereum и др.).",
+            "description": (
+                "Узнать текущий курс криптовалюты (Bitcoin, Ethereum и др.) вместе "
+                "с источником и временем. В ответе всегда указывай source и fetched_at."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -202,7 +216,12 @@ TOOL_SPECS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "get_currency_rate",
-            "description": "Узнать курс обычных валют и при необходимости пересчитать сумму.",
+            "description": (
+                "Узнать курс фиатных валют (USD, EUR, RUB и т.п.), пересчитать сумму "
+                "и получить источник с временем обновления. Для криптовалют "
+                "(BTC, ETH) используй get_crypto_price, а не этот инструмент. "
+                "В ответе всегда указывай source и fetched_at."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -236,13 +255,39 @@ TOOL_SPECS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "read_file",
-            "description": "Прочитать текстовый файл из папки workspace.",
+            "name": "read_url",
+            "description": (
+                "Прочитать веб-страницу (новость, статью, архив) и вернуть заголовок "
+                "и основной текст без HTML. Используй после web_search, чтобы получить "
+                "факты и детали со страницы."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Путь внутри workspace, например notes.txt."},
-                    "max_bytes": {"type": "integer", "description": "Максимальный размер файла в байтах."},
+                    "url": {"type": "string", "description": "Полный http/https URL страницы."},
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "Сколько символов текста вернуть (500-8000).",
+                        "default": 4000,
+                    },
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": (
+                "Прочитать текстовый файл или документ .docx из папки workspace. "
+                "Для .docx извлекает абзацы и таблицы."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Путь внутри workspace, например notes.txt или report.docx."},
+                    "max_bytes": {"type": "integer", "description": "Максимальный размер текста (символов для .docx)."},
                 },
                 "required": ["path"],
             },

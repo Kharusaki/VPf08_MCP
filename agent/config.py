@@ -92,6 +92,9 @@ class Settings:
     max_read_bytes: int = 200_000
     max_write_bytes: int = 1_000_000
     max_tool_result_chars: int = 6_000
+    # Чтение файлов — исключение: текст документа нужен модели целиком,
+    # иначе саммари строится по первым абзацам. Отдельный повышенный лимит.
+    max_file_result_chars: int = 60_000
 
 
 def _load_settings() -> Settings:
