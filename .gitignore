@@ -1,12 +1,12 @@
-# Секреты — никогда не коммитим
+# Секреты
 .env
 
-# Виртуальное окружение
+# Виртуальные окружения
 venv/
 .venv/
 env/
 
-# Кэш Python
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -14,32 +14,23 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 
-# Логи
+# Логи и блокировки
 *.log
-
-# Файл блокировки бота (защита от повторного запуска)
 *.lock
 
-# Временные файлы Word
+# Runtime-данные: база, история, временные файлы
+data/*
+!data/.gitkeep
+*.db
+*.db-shm
+*.db-wal
+
+# Документы и временные файлы Word
+*.docx
 ~$*
-~WRL*.tmp
 
-# Данные, которые создаются во время работы агента
-memory.json
-memory.json.broken
-memory.json.tmp
-reminders.json
-reminders.json.tmp
-workspace/*
-!workspace/.gitkeep
-
-# Настройки IDE
+# IDE и ОС
 .vscode/
 .idea/
-
-# Системный мусор Windows/macOS
 Thumbs.db
 .DS_Store
-
-# Учебные документы (не часть проекта)
-*.docx
