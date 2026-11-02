@@ -11,6 +11,7 @@ from .agent import SalesAgent
 from .config import Settings, load_settings
 from .history import HistoryStore
 from .mcp_client import MCPClient
+from .preferences import PreferencesStore
 
 
 @dataclass(frozen=True)
@@ -19,6 +20,7 @@ class AppContext:
 
     settings: Settings
     history: HistoryStore
+    preferences: PreferencesStore
     mcp: MCPClient
     agent: SalesAgent
 
@@ -32,10 +34,17 @@ class AppContext:
             max_chars=settings.history_max_chars,
             max_message_chars=settings.max_message_chars,
         )
+        preferences = PreferencesStore(settings.preferences_file)
         mcp = MCPClient(
             settings.mcp_url,
             timeout=settings.mcp_timeout,
             read_timeout=settings.mcp_read_timeout,
         )
         agent = SalesAgent(settings=settings, mcp_client=mcp, history=history)
-        return cls(settings=settings, history=history, mcp=mcp, agent=agent)
+        return cls(
+            settings=settings,
+            history=history,
+            preferences=preferences,
+            mcp=mcp,
+            agent=agent,
+        )

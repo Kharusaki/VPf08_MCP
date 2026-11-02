@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -16,6 +17,7 @@ import pytest
 from telegram_bot.agent import SalesAgent
 from telegram_bot.config import Settings
 from telegram_bot.history import HistoryStore
+from telegram_bot.prompts import CONTINUE_PROMPT
 
 
 class FakeMessage:
@@ -48,10 +50,15 @@ class FakeMessage:
         return data
 
 
-def fake_response(content: str | None = None, tool_calls: list[Any] | None = None):
+def fake_response(
+    content: str | None = None,
+    tool_calls: list[Any] | None = None,
+    finish_reason: str | None = None,
+):
     """Собрать ответ в форме, которую ожидает агент."""
     message = FakeMessage(content=content, tool_calls=tool_calls)
-    return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+    choice = SimpleNamespace(message=message, finish_reason=finish_reason)
+    return SimpleNamespace(choices=[choice])
 
 
 class FakeCompletions:
@@ -121,6 +128,8 @@ def make_settings(tmp_path: Path) -> Settings:
         history_limit=10,
         history_max_chars=5000,
         max_message_chars=1000,
+        preferences_file=tmp_path / "preferences.json",
+        max_continuations=2,
         log_file=tmp_path / "bot.log",
     )
 
@@ -182,3 +191,58 @@ async def test_agent_returns_tool_error_to_model(tmp_path) -> None:
     tool_message = fake_openai.chat.completions.requests[1]["messages"][-1]
     assert tool_message["role"] == "tool"
     assert "Некорректный JSON" in tool_message["content"]
+
+
+@pytest.mark.asyncio
+async def test_agent_continues_truncated_answer(tmp_path) -> None:
+    fake_openai = FakeOpenAI(
+        [
+            fake_response(content="Первая часть ответа", finish_reason="length"),
+            fake_response(content="и вторая часть.", finish_reason="stop"),
+        ]
+    )
+    history = HistoryStore(tmp_path / "history.json", limit=10)
+    agent = SalesAgent(
+        settings=make_settings(tmp_path),
+        mcp_client=FakeMCP(),  # type: ignore[arg-type]
+        history=history,
+        openai_client=fake_openai,  # type: ignore[arg-type]
+    )
+
+    answer = await agent.run(1, "Расскажи подробно", max_tokens=1234)
+
+    assert answer == "Первая часть ответа и вторая часть."
+    requests = fake_openai.chat.completions.requests
+    assert len(requests) == 2
+    assert requests[0]["max_tokens"] == 1234
+    assert requests[1]["max_tokens"] == 1234
+    assert requests[1]["messages"][-1] == {
+        "role": "user",
+        "content": CONTINUE_PROMPT,
+    }
+    assert history.get(1)[-1] == {
+        "role": "assistant",
+        "content": "Первая часть ответа и вторая часть.",
+    }
+
+
+@pytest.mark.asyncio
+async def test_agent_stops_after_continuation_limit(tmp_path) -> None:
+    settings = replace(make_settings(tmp_path), max_continuations=1)
+    fake_openai = FakeOpenAI(
+        [
+            fake_response(content="Начало", finish_reason="length"),
+            fake_response(content="продолжение", finish_reason="length"),
+        ]
+    )
+    agent = SalesAgent(
+        settings=settings,
+        mcp_client=FakeMCP(),  # type: ignore[arg-type]
+        history=HistoryStore(tmp_path / "history.json", limit=10),
+        openai_client=fake_openai,  # type: ignore[arg-type]
+    )
+
+    answer = await agent.run(1, "Расскажи подробно")
+
+    assert answer == "Начало продолжение …"
+    assert len(fake_openai.chat.completions.requests) == 2

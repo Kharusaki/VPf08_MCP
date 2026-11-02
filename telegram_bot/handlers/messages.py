@@ -39,8 +39,13 @@ async def text_message(message: Message, app: AppContext) -> None:
     chat_id = message.chat.id
     try:
         await message.bot.send_chat_action(chat_id=chat_id, action="typing")
+        max_tokens = app.preferences.max_tokens_for(chat_id, app.settings.max_tokens)
         async with _chat_lock(chat_id):
-            answer = await app.agent.run(chat_id, message.text or "")
+            answer = await app.agent.run(
+                chat_id,
+                message.text or "",
+                max_tokens=max_tokens,
+            )
     except MCPServiceError:
         logger.exception("MCP-сервер недоступен при обработке сообщения")
         await message.answer(SERVICE_UNAVAILABLE_TEXT)

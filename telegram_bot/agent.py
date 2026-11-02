@@ -16,7 +16,7 @@ from openai import AsyncOpenAI
 from .config import Settings
 from .history import HistoryStore
 from .mcp_client import MCPClient
-from .prompts import SYSTEM_PROMPT
+from .prompts import CONTINUE_PROMPT, SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +92,7 @@ class SalesAgent:
         messages: list[dict[str, Any]],
         tool_specs: list[dict[str, Any]],
         allow_tools: bool = True,
+        max_tokens: int | None = None,
     ) -> tuple[Any, str]:
         """Запрос к основной модели с запасной моделью при ошибке."""
         if self._client is None:
@@ -104,9 +105,13 @@ class SalesAgent:
         ):
             models.append(self.settings.fallback_model)
 
+        # max_tokens приходит из режима /length; без него действует .env.
+        effective_max_tokens = (
+            self.settings.max_tokens if max_tokens is None else int(max_tokens)
+        )
         kwargs: dict[str, Any] = {
             "temperature": self.settings.temperature,
-            "max_tokens": self.settings.max_tokens,
+            "max_tokens": max(1, effective_max_tokens),
         }
         if allow_tools and tool_specs:
             kwargs["tools"] = tool_specs
@@ -164,7 +169,97 @@ class SalesAgent:
         except OSError:
             logger.exception("Не удалось сохранить историю диалога")
 
-    async def run(self, chat_id: int | str, user_message: str) -> str:
+    @staticmethod
+    def _join_parts(left: str, right: str) -> str:
+        """Склеить две части ответа, не ломая пробелы и знаки препинания."""
+        left = left.rstrip()
+        right = right.lstrip()
+        if not left:
+            return right
+        if not right:
+            return left
+        opening = {" ", "\n", "\t", "(", "[", "{", "«", "“", "-"}
+        closing = {" ", "\n", "\t", ".", ",", ";", ":", "!", "?", ")", "]", "}", "»", "”", "\"", "'", "…"}
+        if left[-1] in opening or right[0] in closing:
+            return left + right
+        return f"{left} {right}"
+
+    async def _finalize_answer(
+        self,
+        chat_id: int | str,
+        question: str,
+        response: Any,
+        messages: list[dict[str, Any]],
+        tool_specs: list[dict[str, Any]],
+        max_tokens: int | None,
+    ) -> str:
+        """Достроить ответ, если модель остановилась по лимиту токенов.
+
+        Провайдеры сообщают об этом через ``finish_reason="length"``. В этом
+        случае просим модель продолжить с места обрыва и склеиваем части.
+        Число продолжений ограничено, чтобы расход токенов оставался конечным.
+        """
+        if not response.choices:
+            raise AgentError("Модель вернула пустой ответ.")
+
+        choice = response.choices[0]
+        message = choice.message
+        answer = (getattr(message, "content", None) or "").strip()
+        if not answer:
+            raise AgentError("Модель вернула пустой ответ.")
+
+        continuations = 0
+        limit = max(0, int(self.settings.max_continuations))
+        while (
+            getattr(choice, "finish_reason", None) == "length"
+            and continuations < limit
+        ):
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": getattr(message, "content", None) or answer,
+                }
+            )
+            messages.append({"role": "user", "content": CONTINUE_PROMPT})
+            try:
+                response, _model = await self._completion(
+                    messages,
+                    tool_specs,
+                    allow_tools=False,
+                    max_tokens=max_tokens,
+                )
+            except AgentError:
+                logger.warning("Не удалось продолжить оборванный ответ")
+                break
+
+            if not response.choices:
+                break
+            choice = response.choices[0]
+            message = choice.message
+            part = (getattr(message, "content", None) or "").strip()
+            if not part:
+                break
+            answer = self._join_parts(answer, part)
+            continuations += 1
+            logger.info("Ответ продолжен: %d из %d", continuations, limit)
+
+        if getattr(choice, "finish_reason", None) == "length":
+            logger.warning(
+                "Ответ достиг лимита длины после %d продолжений",
+                continuations,
+            )
+            if not answer.endswith(("…", "...")):
+                answer = f"{answer.rstrip()} …"
+
+        self._remember(chat_id, question, answer)
+        return answer
+
+    async def run(
+        self,
+        chat_id: int | str,
+        user_message: str,
+        max_tokens: int | None = None,
+    ) -> str:
         """Обработать сообщение пользователя и вернуть финальный текст."""
         question = (user_message or "").strip()
         if not question:
@@ -179,18 +274,23 @@ class SalesAgent:
             ]
 
             for _ in range(max(1, self.settings.max_tool_rounds)):
-                response, _model = await self._completion(messages, tool_specs)
+                response, _model = await self._completion(
+                    messages, tool_specs, max_tokens=max_tokens
+                )
                 if not response.choices:
                     raise AgentError("Модель вернула пустой ответ.")
 
                 message = response.choices[0].message
                 tool_calls = getattr(message, "tool_calls", None)
                 if not tool_calls:
-                    answer = (getattr(message, "content", None) or "").strip()
-                    if not answer:
-                        raise AgentError("Модель вернула пустой ответ.")
-                    self._remember(chat_id, question, answer)
-                    return answer
+                    return await self._finalize_answer(
+                        chat_id,
+                        question,
+                        response,
+                        messages,
+                        tool_specs,
+                        max_tokens,
+                    )
 
                 messages.append(message.model_dump(exclude_none=True))
 
@@ -230,12 +330,18 @@ class SalesAgent:
                 }
             )
             response, _model = await self._completion(
-                messages, tool_specs, allow_tools=False
+                messages,
+                tool_specs,
+                allow_tools=False,
+                max_tokens=max_tokens,
             )
-            answer = ""
-            if response.choices:
-                answer = (getattr(response.choices[0].message, "content", None) or "").strip()
-            if not answer:
+            if not response.choices:
                 raise AgentError("Не удалось завершить диалог за отведённое число шагов.")
-            self._remember(chat_id, question, answer)
-            return answer
+            return await self._finalize_answer(
+                chat_id,
+                question,
+                response,
+                messages,
+                tool_specs,
+                max_tokens,
+            )

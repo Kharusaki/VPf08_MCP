@@ -59,6 +59,7 @@ async def _setup_bot(bot: Bot) -> None:
             [
                 BotCommand(command="start", description="Начать диалог"),
                 BotCommand(command="courses", description="Каталог курсов"),
+                BotCommand(command="length", description="Длина ответов"),
                 BotCommand(command="help", description="Помощь"),
                 BotCommand(command="clear", description="Очистить историю"),
                 BotCommand(command="status", description="Статус бота"),

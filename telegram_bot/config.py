@@ -76,6 +76,10 @@ class Settings:
     history_max_chars: int
     max_message_chars: int
 
+    # Настройки пользователей и автопродолжение длинных ответов
+    preferences_file: Path
+    max_continuations: int
+
     log_file: Path
 
     def missing_required(self) -> list[str]:
@@ -117,5 +121,9 @@ def load_settings() -> Settings:
         history_limit=_int("HISTORY_LIMIT", 12),
         history_max_chars=_int("HISTORY_MAX_CHARS", 9000),
         max_message_chars=_int("MAX_MESSAGE_CHARS", 4000),
+        preferences_file=_path(
+            "PREFERENCES_FILE", BASE_DIR / "data" / "preferences.json"
+        ),
+        max_continuations=_int("MAX_CONTINUATIONS", 2),
         log_file=_path("LOG_FILE", BASE_DIR / "data" / "bot.log"),
     )
