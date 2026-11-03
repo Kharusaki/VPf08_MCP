@@ -25,6 +25,11 @@ data/*
 *.db-shm
 *.db-wal
 
+# Резервные копии базы и выгрузки
+*.backup.db
+*.bak
+*.sql
+
 # Документы и временные файлы Word
 *.docx
 ~$*
@@ -34,3 +39,7 @@ data/*
 .idea/
 Thumbs.db
 .DS_Store
+
+# Временные файлы редакторов и Word
+*.tmp
+~WRL*

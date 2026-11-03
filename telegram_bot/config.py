@@ -80,6 +80,10 @@ class Settings:
     preferences_file: Path
     max_continuations: int
 
+    # Напоминание о заявке после паузы в диалоге
+    reminder_delay_seconds: int
+    reminder_poll_seconds: int
+
     log_file: Path
 
     def missing_required(self) -> list[str]:
@@ -125,5 +129,7 @@ def load_settings() -> Settings:
             "PREFERENCES_FILE", BASE_DIR / "data" / "preferences.json"
         ),
         max_continuations=_int("MAX_CONTINUATIONS", 2),
+        reminder_delay_seconds=_int("REMINDER_DELAY_SECONDS", 120),
+        reminder_poll_seconds=_int("REMINDER_POLL_SECONDS", 15),
         log_file=_path("LOG_FILE", BASE_DIR / "data" / "bot.log"),
     )

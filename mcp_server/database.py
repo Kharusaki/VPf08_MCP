@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 from collections.abc import Iterator
 
-from .seed import seed_database
+from .seed import seed_database, sync_promo_conditions
 
 logger = logging.getLogger(__name__)
 
@@ -76,13 +76,59 @@ CREATE TABLE IF NOT EXISTS leads (
     course_id INTEGER NOT NULL REFERENCES courses(id),
     preferred_time TEXT NOT NULL DEFAULT '',
     comment TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL DEFAULT 'new'
+    status TEXT NOT NULL DEFAULT 'new',
+    promo_code TEXT NOT NULL DEFAULT '',
+    discount_percent INTEGER NOT NULL DEFAULT 0,
+    total_price INTEGER NOT NULL DEFAULT 0,
+    history TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS reminders (
+    chat_id INTEGER PRIMARY KEY,
+    due_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    sent_at TEXT,
+    lead_created INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_courses_language ON courses(language);
 CREATE INDEX IF NOT EXISTS idx_courses_price ON courses(price);
 CREATE INDEX IF NOT EXISTS idx_leads_contact ON leads(contact);
+CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders(status, due_at);
 """
+
+# Витрина для менеджера: одна строка = одна заявка со всеми деньгами.
+# В ``leads`` лежит course_id, и смотреть цены «глазами» через SELECT * неудобно:
+# приходится помнить курс в голове или делать JOIN. Вьюха отдаёт название курса,
+# базовую цену, скидку в рублях и итог — видно и скидку, и сумму к оплате.
+LEADS_VIEW = """
+CREATE VIEW IF NOT EXISTS lead_details AS
+SELECT
+    l.id,
+    l.created_at,
+    l.name,
+    l.contact,
+    l.course_id,
+    c.title AS course,
+    c.price AS base_price,
+    l.promo_code,
+    l.discount_percent,
+    c.price - l.total_price AS discount_rub,
+    l.total_price,
+    l.status,
+    l.preferred_time,
+    l.comment,
+    l.history
+FROM leads l
+JOIN courses c ON c.id = l.course_id
+"""
+
+# Единый формат времени в базе: UTC, секунды. Так строки сравниваются как даты.
+_TS = "%Y-%m-%d %H:%M:%S"
+
+# Сколько последних строк хранить в журнале заявки (колонка leads.history).
+HISTORY_MAX_LINES = 20
 
 # Пользователь может написать язык по-русски или по-английски — приводим к языку в базе.
 _LANGUAGE_ALIASES = {
@@ -187,15 +233,48 @@ class CourseDatabase:
             connection.close()
 
     def initialize(self) -> None:
-        """Создать схему и заполнить пустую базу стартовым каталогом."""
+        """Создать схему, заполнить пустую базу каталогом и обновить условия акций."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(SCHEMA)
+            self._migrate(connection)
+            connection.executescript(LEADS_VIEW)
             count = connection.execute("SELECT COUNT(*) FROM courses").fetchone()[0]
             if count == 0:
                 seed_database(connection)
                 logger.info("База создана и заполнена стартовым каталогом: %s", self.path)
+            else:
+                sync_promo_conditions(connection)
+
+    @staticmethod
+    def _migrate(connection: sqlite3.Connection) -> None:
+        """Добавить колонки заявки, появившиеся после выпуска первой версии схемы.
+
+        ``CREATE TABLE IF NOT EXISTS`` не досоздаёт поля в существующей таблице,
+        поэтому старые базы обновляются точечно и сохранённые заявки не теряются.
+        """
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(leads)").fetchall()
+        }
+        for name, definition in (
+            ("promo_code", "TEXT NOT NULL DEFAULT ''"),
+            ("discount_percent", "INTEGER NOT NULL DEFAULT 0"),
+            ("total_price", "INTEGER NOT NULL DEFAULT 0"),
+            ("history", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if name not in columns:
+                connection.execute(f"ALTER TABLE leads ADD COLUMN {name} {definition}")
+
+        # Заявки из старой базы не имеют итога: проставляем стоимость курса,
+        # иначе в таблице у всех прежних записей красуется 0 ₽.
+        connection.execute(
+            """
+            UPDATE leads SET total_price = (
+                SELECT c.price FROM courses c WHERE c.id = leads.course_id
+            ) WHERE total_price = 0
+            """
+        )
 
     def search_courses(
         self,
@@ -355,6 +434,7 @@ class CourseDatabase:
         course_id: int,
         preferred_time: str = "",
         comment: str = "",
+        promo_code: str = "",
     ) -> tuple[dict[str, Any] | None, bool]:
         """Сохранить заявку и вернуть ``(заявка, создана_ли_новая)``.
 
@@ -381,11 +461,17 @@ class CourseDatabase:
             if existing is not None:
                 return dict(existing), False
 
+            promo = self._promo_row(connection, promo_code)
+            code = promo["code"] if promo else ""
+            percent = int(promo["discount_percent"]) if promo else 0
+            total = self._lead_total(connection, course_id, percent)
+
             cursor = connection.execute(
                 """
                 INSERT INTO leads (
-                    created_at, name, contact, course_id, preferred_time, comment, status
-                ) VALUES (?, ?, ?, ?, ?, ?, 'new')
+                    created_at, name, contact, course_id, preferred_time, comment, status,
+                    promo_code, discount_percent, total_price
+                ) VALUES (?, ?, ?, ?, ?, ?, 'new', ?, ?, ?)
                 """,
                 (
                     created_at,
@@ -394,10 +480,464 @@ class CourseDatabase:
                     course_id,
                     preferred_time.strip(),
                     comment.strip(),
+                    code,
+                    percent,
+                    total,
                 ),
             )
+            note = f"Заявка создана: курс {course_id}, {total} ₽"
+            if code:
+                note += f", скидка {percent}% по промокоду {code}"
+            self.append_history(connection, int(cursor.lastrowid), note)
             row = connection.execute(
                 "SELECT * FROM leads WHERE id = ?", (cursor.lastrowid,)
             ).fetchone()
 
         return dict(row), True
+
+    @staticmethod
+    def _promo_row(connection: sqlite3.Connection, code: str) -> sqlite3.Row | None:
+        """Найти активный промокод внутри открытого соединения."""
+        normalized = (code or "").strip().upper()
+        if not normalized:
+            return None
+        return connection.execute(
+            """
+            SELECT code, discount_percent FROM promos
+            WHERE upper(code) = ? AND active = 1
+            """,
+            (normalized,),
+        ).fetchone()
+
+    @staticmethod
+    def _lead_total(
+        connection: sqlite3.Connection,
+        course_id: int,
+        discount_percent: int,
+    ) -> int:
+        """Цена заявки: стоимость курса минус скидка применённого промокода."""
+        row = connection.execute(
+            "SELECT price FROM courses WHERE id = ?", (course_id,)
+        ).fetchone()
+        price = int(row["price"]) if row else 0
+        return price - round(price * int(discount_percent) / 100)
+
+    @staticmethod
+    def append_history(
+        connection: sqlite3.Connection,
+        lead_id: int,
+        note: str,
+    ) -> None:
+        """Дописать строку в журнал заявки.
+
+        Журнал живёт в колонке ``leads.history``, чтобы менеджер видел историю
+        работы с клиентом прямо в таблице: что создали, какую скидку поставили,
+        что исправили и когда отменили. Без него заявка выглядит так, будто её
+        ни разу не меняли, — именно на это жаловался тест пользователя.
+        """
+        stamp = datetime.now().strftime("%d.%m %H:%M")
+        row = connection.execute(
+            "SELECT history FROM leads WHERE id = ?", (lead_id,)
+        ).fetchone()
+        lines = [line for line in (row["history"] if row else "").splitlines() if line]
+        lines.append(f"{stamp} {note.strip()}"[:300])
+        connection.execute(
+            "UPDATE leads SET history = ? WHERE id = ?",
+            ("\n".join(lines[-HISTORY_MAX_LINES:]), lead_id),
+        )
+
+    def find_contact_key(self, contact: str) -> str | None:
+        """Найти реальный ключ контакта в базе по тому, что назвал клиент.
+
+        Клиенты часто пишут несколько контактов сразу: «olga@mail.ru, +79055553322».
+        Точное совпадение тогда не находит заявку, и бот отвечает «заявок нет».
+        Поэтому сначала пробуем точное совпадение, а затем ищем запись, которая
+        содержит названный контакт как подстроку.
+        """
+        contact_key = (contact or "").strip().lower()
+        if len(contact_key) < 5:
+            return None
+        with self._connect() as connection:
+            exact = connection.execute(
+                "SELECT lower(contact) AS key FROM leads WHERE lower(contact) = ? LIMIT 1",
+                (contact_key,),
+            ).fetchone()
+            if exact is not None:
+                return str(exact["key"])
+            partial = connection.execute(
+                """
+                SELECT lower(contact) AS key FROM leads
+                WHERE instr(lower(contact), ?) > 0 ORDER BY id DESC LIMIT 1
+                """,
+                (contact_key,),
+            ).fetchone()
+        return str(partial["key"]) if partial else None
+
+    def list_leads(self, contact: str, limit: int = 10) -> list[dict[str, Any]]:
+        """Вернуть последние заявки клиента по контакту.
+
+        Нужен, чтобы бот отвечал о составе заказа из базы, а не по памяти диалога:
+        в длинном разговоре модель иначе путает курсы между заявками.
+        """
+        contact_key = self.find_contact_key(contact)
+        if not contact_key:
+            return []
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT l.id, l.created_at, l.name, l.contact, l.course_id, c.title,
+                       c.price, l.preferred_time, l.comment, l.status,
+                       l.promo_code, l.discount_percent, l.total_price, l.history
+                FROM leads l
+                JOIN courses c ON c.id = l.course_id
+                WHERE lower(contact) = ?
+                ORDER BY l.id DESC
+                LIMIT ?
+                """,
+                (contact_key, max(1, int(limit))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_lead(
+        self,
+        lead_id: int,
+        comment: str | None = None,
+        preferred_time: str | None = None,
+        status: str | None = None,
+        course_id: int | None = None,
+        promo_code: str | None = None,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Изменить заявку: курс, промокод, комментарий, время или статус.
+
+        Возвращает ``(заявка, ошибка)``. ``None`` в поле означает «не менять»,
+        поэтому частичное обновление не затирает сохранённые значения.
+        ``promo_code=""`` — снять скидку с заявки.
+
+        Каждое изменение попадает в ``leads.history``: в базе остаётся видно,
+        что именно и когда исправили по просьбе клиента.
+        """
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT l.*, c.title, c.price FROM leads l
+                JOIN courses c ON c.id = l.course_id
+                WHERE l.id = ?
+                """,
+                (lead_id,),
+            ).fetchone()
+            if row is None:
+                return None, "Заявка с таким ID не найдена. Уточните её через get_lead_details."
+
+            fields: dict[str, Any] = {}
+            notes: list[str] = []
+
+            if comment is not None and comment.strip() != row["comment"]:
+                fields["comment"] = comment.strip()[:500]
+                notes.append("комментарий обновлён")
+            if preferred_time is not None and preferred_time.strip() != row["preferred_time"]:
+                fields["preferred_time"] = preferred_time.strip()[:120]
+                notes.append(f"удобное время: {preferred_time.strip()[:120] or 'не указано'}")
+            if status is not None and status.strip() != row["status"]:
+                fields["status"] = status.strip()[:32]
+                notes.append(f"статус: {status.strip()[:32]}")
+
+            target_course = row["course_id"]
+            if course_id is not None and int(course_id) != row["course_id"]:
+                if self._course_row(connection, int(course_id)) is None:
+                    return None, "Новый курс не найден в каталоге. Уточните его через search_courses."
+                target_course = int(course_id)
+                fields["course_id"] = target_course
+                notes.append(f"курс заменён на {target_course}")
+
+            percent = int(row["discount_percent"])
+            code = row["promo_code"]
+            if promo_code is not None:
+                promo = self._promo_row(connection, promo_code)
+                if promo is None and promo_code.strip():
+                    return None, (
+                        f"Промокод «{promo_code.strip()}» не найден или неактивен."
+                    )
+                code = promo["code"] if promo else ""
+                percent = int(promo["discount_percent"]) if promo else 0
+                fields["promo_code"] = code
+                fields["discount_percent"] = percent
+                notes.append(
+                    f"скидка {percent}% по промокоду {code}" if code else "скидка снята"
+                )
+
+            if fields:
+                fields["total_price"] = self._lead_total(connection, target_course, percent)
+                assignments = ", ".join(f"{name} = ?" for name in fields)
+                connection.execute(
+                    f"UPDATE leads SET {assignments} WHERE id = ?",
+                    [*fields.values(), lead_id],
+                )
+                if notes:
+                    self.append_history(
+                        connection,
+                        lead_id,
+                        "Исправлено: " + "; ".join(notes)
+                        + f". Итог {fields['total_price']} ₽",
+                    )
+                row = connection.execute(
+                    """
+                    SELECT l.*, c.title, c.price FROM leads l
+                    JOIN courses c ON c.id = l.course_id
+                    WHERE l.id = ?
+                    """,
+                    (lead_id,),
+                ).fetchone()
+
+        return dict(row), None
+
+    def cancel_lead(self, lead_id: int) -> tuple[bool, str | None]:
+        """Отменить заявку по ID.
+
+        Заявку не удаляем из таблицы: менеджеру нужен след от отказа клиента.
+        Статус ставится ``cancelled``, в журнал добавляется причина.
+        """
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT id, status FROM leads WHERE id = ?", (lead_id,)
+            ).fetchone()
+            if row is None:
+                return False, "Заявка с таким ID не найдена. Уточните её через get_lead_details."
+            connection.execute(
+                "UPDATE leads SET status = 'cancelled' WHERE id = ?", (lead_id,)
+            )
+            self.append_history(connection, lead_id, "заявка отменена по просьбе клиента")
+        return True, None
+
+    @staticmethod
+    def _course_row(
+        connection: sqlite3.Connection, course_id: int
+    ) -> sqlite3.Row | None:
+        """Найти курс внутри открытого соединения, чтобы не открывать второе."""
+        return connection.execute(
+            "SELECT id, title, price FROM courses WHERE id = ?", (int(course_id),)
+        ).fetchone()
+
+    def get_lead(self, lead_id: int) -> dict[str, Any] | None:
+        """Вернуть заявку по ID вместе с названием и базовой ценой курса."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT l.*, c.title, c.price
+                FROM leads l JOIN courses c ON c.id = l.course_id
+                WHERE l.id = ?
+                """,
+                (lead_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def apply_promo_to_contact(
+        self,
+        contact: str,
+        promo_code: str,
+        course_id: int = 0,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        """Применить промокод ровно к одной заявке клиента и пересчитать цены.
+
+        Возвращает ``(обновлённые заявки, ошибку)``. Сначала у всех заявок
+        контакта снимается скидка и цены возвращаются к базовым, затем скидка
+        начисляется выбранной заявке. Так заказ не может получить скидку на все
+        курсы сразу — правило центра «промокод на один курс» обеспечивается
+        на уровне базы, а не уговорами модели.
+
+        ``course_id = 0`` означает «самый дорогой курс из заявок»: так скидка
+        даёт наибольшую выгоду клиенту.
+        """
+        if not (contact or "").strip():
+            return [], "Укажите контакт, по которому искать заявки."
+        contact_key = self.find_contact_key(contact)
+        if not contact_key:
+            return [], "Заявок с таким контактом нет. Уточните контакт или создайте заявку."
+
+        with self._connect() as connection:
+            promo = self._promo_row(connection, promo_code)
+            if promo is None:
+                return [], f"Промокод «{(promo_code or '').strip()}» не найден или неактивен."
+
+            rows = connection.execute(
+                """
+                SELECT l.*, c.price FROM leads l
+                JOIN courses c ON c.id = l.course_id
+                WHERE lower(contact) = ?
+                ORDER BY l.id
+                """,
+                (contact_key,),
+            ).fetchall()
+
+            code = promo["code"]
+            percent = int(promo["discount_percent"])
+
+            # Шаг 1: снять скидку со всех заявок — иначе она «залипнет» на нескольких.
+            connection.execute(
+                """
+                UPDATE leads SET promo_code = '', discount_percent = 0
+                WHERE lower(contact) = ?
+                """,
+                (contact_key,),
+            )
+            for row in rows:
+                connection.execute(
+                    "UPDATE leads SET total_price = ? WHERE id = ?",
+                    (int(row["price"]), row["id"]),
+                )
+
+            # Шаг 2: начислить скидку выбранной заявке.
+            target = None
+            if course_id:
+                target = next((row for row in rows if row["course_id"] == int(course_id)), None)
+                if target is None:
+                    return [], "Курс не входит в заявки этого клиента."
+            else:
+                target = max(rows, key=lambda row: (int(row["price"]), -row["id"]))
+
+            total = self._lead_total(connection, target["course_id"], percent)
+            connection.execute(
+                """
+                UPDATE leads
+                SET promo_code = ?, discount_percent = ?, total_price = ?
+                WHERE id = ?
+                """,
+                (code, percent, total, target["id"]),
+            )
+            # Журнал: видно, что скидка переехала, а не «применилась сама».
+            for row in rows:
+                if row["id"] == target["id"]:
+                    self.append_history(
+                        connection,
+                        int(row["id"]),
+                        f"скидка {percent}% по промокоду {code}, итог {total} ₽",
+                    )
+                elif row["promo_code"]:
+                    self.append_history(
+                        connection,
+                        int(row["id"]),
+                        f"скидка {row['discount_percent']}% снята (промокод на один курс)",
+                    )
+
+            updated = connection.execute(
+                """
+                SELECT l.*, c.title, c.price FROM leads l
+                JOIN courses c ON c.id = l.course_id
+                WHERE lower(l.contact) = ?
+                ORDER BY l.id
+                """,
+                (contact_key,),
+            ).fetchall()
+
+        return [dict(row) for row in updated], None
+
+    # --- Напоминания о заявке -------------------------------------------------
+    #
+    # Расписание живёт в базе, а не в памяти бота: после перезапуска бота
+    # напоминания не теряются, а сервер остаётся единственным источником правды.
+    # Состояния: pending — ждёт отправки, sent — уже отправлено,
+    # cancelled — отменено (создана заявка или диалог очищен).
+
+    def schedule_reminder(self, chat_id: int, delay_seconds: int) -> dict[str, Any]:
+        """Запланировать напоминание через ``delay_seconds`` после активности.
+
+        Повторный вызов перезаписывает время: таймер отсчитывается от последнего
+        сообщения пользователя. Если заявка уже создана или напоминание в этом
+        диалоге отправлено, расписание не меняется.
+        """
+        now = datetime.now(timezone.utc)
+        due_at = (now + timedelta(seconds=max(0, int(delay_seconds)))).strftime(_TS)
+        created_at = now.strftime(_TS)
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM reminders WHERE chat_id = ?", (chat_id,)
+            ).fetchone()
+
+            if row is not None and (row["lead_created"] or row["status"] == "sent"):
+                return dict(row)
+
+            connection.execute(
+                """
+                INSERT INTO reminders (chat_id, due_at, status, created_at, sent_at, lead_created)
+                VALUES (?, ?, 'pending', ?, NULL, 0)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    due_at = excluded.due_at,
+                    status = 'pending',
+                    created_at = excluded.created_at,
+                    sent_at = NULL
+                """,
+                (chat_id, due_at, created_at),
+            )
+            row = connection.execute(
+                "SELECT * FROM reminders WHERE chat_id = ?", (chat_id,)
+            ).fetchone()
+
+        return dict(row)
+
+    def cancel_reminder(self, chat_id: int, reason: str = "cancelled") -> bool:
+        """Отменить ожидающее напоминание чата. Возвращает ``True``, если что-то сняли."""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE reminders SET status = ?
+                WHERE chat_id = ? AND status = 'pending'
+                """,
+                (reason, chat_id),
+            )
+            cancelled = cursor.rowcount > 0
+        return cancelled
+
+    def mark_lead_created(self, chat_id: int) -> None:
+        """Запомнить, что заявка создана: напоминание больше не нужно."""
+        now = datetime.now(timezone.utc).strftime(_TS)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO reminders (chat_id, due_at, status, created_at, sent_at, lead_created)
+                VALUES (?, ?, 'cancelled', ?, NULL, 1)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    status = 'cancelled',
+                    lead_created = 1
+                """,
+                (chat_id, now, now),
+            )
+
+    def reset_reminder(self, chat_id: int) -> None:
+        """Забыть состояние чата, чтобы напоминание снова стало возможным."""
+        with self._connect() as connection:
+            connection.execute("DELETE FROM reminders WHERE chat_id = ?", (chat_id,))
+
+    def due_reminders(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Вернуть напоминания, время которых наступило."""
+        now = datetime.now(timezone.utc).strftime(_TS)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT chat_id, due_at FROM reminders
+                WHERE status = 'pending' AND lead_created = 0 AND due_at <= ?
+                ORDER BY due_at LIMIT ?
+                """,
+                (now, max(1, int(limit))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_reminder_sent(self, chat_id: int) -> bool:
+        """Отметить напоминание отправленным. ``False`` — его уже сняли."""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE reminders SET status = 'sent', sent_at = ?
+                WHERE chat_id = ? AND status = 'pending' AND lead_created = 0
+                """,
+                (datetime.now(timezone.utc).strftime(_TS), chat_id),
+            )
+            marked = cursor.rowcount > 0
+        return marked
+
+    def reminder_status(self, chat_id: int) -> dict[str, Any] | None:
+        """Вернуть состояние напоминания чата или ``None``, если его нет."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM reminders WHERE chat_id = ?", (chat_id,)
+            ).fetchone()
+        return dict(row) if row else None

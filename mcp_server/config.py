@@ -41,14 +41,23 @@ def _path(name: str, default: Path) -> Path:
     return path.resolve()
 
 
+DEFAULT_REMINDER_TEXT = (
+    "Если хотите записаться, напишите имя и удобный контакт — я оформлю заявку, "
+    "и менеджер свяжется с вами, чтобы подтвердить детали. "
+    "Если пока выбираете, просто задайте вопрос — помогу разобраться."
+)
+
+
 @dataclass(frozen=True)
 class ServerSettings:
-    """Параметры HTTP-транспорта и расположения базы."""
+    """Параметры HTTP-транспорта, расположения базы и напоминаний."""
 
     host: str
     port: int
     path: str
     db_path: Path
+    reminder_delay_seconds: int
+    reminder_text: str
 
     @property
     def url(self) -> str:
@@ -67,4 +76,6 @@ def load_settings() -> ServerSettings:
         port=_int("MCP_PORT", 8000),
         path=path,
         db_path=_path("MCP_DB_PATH", BASE_DIR / "data" / "courses.db"),
+        reminder_delay_seconds=max(0, _int("REMINDER_DELAY_SECONDS", 120)),
+        reminder_text=_str("REMINDER_TEXT", DEFAULT_REMINDER_TEXT),
     )

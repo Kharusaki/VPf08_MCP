@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from openai import AsyncOpenAI
 
@@ -19,6 +19,54 @@ from .mcp_client import MCPClient
 from .prompts import CONTINUE_PROMPT, SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
+
+LeadCallback = Callable[[int | str], Awaitable[None]]
+
+# Инструменты, которые меняют заявку. Если клиент просит её изменить, а модель
+# ограничилась обещанием «передам менеджеру», просьба остаётся невыполненной.
+LEAD_MUTATION_TOOLS = frozenset(
+    {"create_lead", "update_lead", "apply_promo_to_lead", "cancel_lead"}
+)
+
+# Обещания, за которыми обязано стоять изменение в базе.
+PROMISE_PATTERNS = (
+    "передам",
+    "передал",
+    "передала",
+    "передад",
+    "сообщу менеджер",
+    "уточню у менеджер",
+    "менеджер свяжется и исправ",
+    "менеджер внес",
+    "исправлю заявку",
+    "изменю заявку",
+    "применю скидку",
+    "промокод примен",
+    "отменю заявку",
+    "удалю заявку",
+)
+
+# Подсказка модели: она вызвала не тот инструмент или отделалась обещанием.
+MUTATION_NUDGE = (
+    "Клиент просил изменить заявку, но в базе ничего не изменилось. "
+    "Сначала получи заявки через get_lead_details по контакту клиента, затем "
+    "выполни изменение инструментом: скидку — apply_promo_to_lead или "
+    "update_lead(promo_code=...), перенос на другой курс — update_lead(course_id=...), "
+    "отмену — cancel_lead. Только после этого отвечай клиенту и называй новый итог."
+)
+
+# Инструменты напоминаний бот вызывает сам, по таймеру. Модели они не нужны:
+# меньше токенов в описании инструментов и нет риска, что модель «запланирует»
+# напоминание вместо ответа пользователю.
+INTERNAL_TOOLS = frozenset(
+    {
+        "schedule_lead_reminder",
+        "cancel_lead_reminder",
+        "get_due_reminders",
+        "complete_lead_reminder",
+        "get_lead_reminder_status",
+    }
+)
 
 
 class AgentError(RuntimeError):
@@ -34,10 +82,12 @@ class SalesAgent:
         mcp_client: MCPClient,
         history: HistoryStore,
         openai_client: AsyncOpenAI | None = None,
+        on_lead_created: LeadCallback | None = None,
     ) -> None:
         self.settings = settings
         self.mcp_client = mcp_client
         self.history = history
+        self._on_lead_created = on_lead_created
         if openai_client is not None:
             self._client: AsyncOpenAI | None = openai_client
         elif settings.openai_api_key:
@@ -64,6 +114,8 @@ class SalesAgent:
         tools = await self.mcp_client.list_tools(session)
         specs: list[dict[str, Any]] = []
         for tool in tools:
+            if tool.name in INTERNAL_TOOLS:
+                continue
             schema = getattr(tool, "inputSchema", None) or {
                 "type": "object",
                 "properties": {},
@@ -148,6 +200,7 @@ class SalesAgent:
         session: Any,
         name: str,
         arguments: dict[str, Any],
+        chat_id: int | str | None = None,
     ) -> str:
         """Выполнить инструмент и ограничить размер результата."""
         if name not in self._tool_names:
@@ -157,9 +210,64 @@ class SalesAgent:
             )
 
         result = await self.mcp_client.call_tool(session, name, arguments)
+        if name == "create_lead" and chat_id is not None:
+            await self._notify_lead_created(chat_id, result)
         if len(result) > self.settings.max_tool_result_chars:
             result = result[: self.settings.max_tool_result_chars] + "… (результат обрезан)"
         return result
+
+    async def _notify_lead_created(self, chat_id: int | str, result: str) -> None:
+        """Сообщить подписчику о новой заявке, чтобы снять напоминание."""
+        if self._on_lead_created is None:
+            return
+        try:
+            data = json.loads(result)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if not isinstance(data, dict) or not data.get("ok") or not data.get("created"):
+            return
+        try:
+            await self._on_lead_created(chat_id)
+        except Exception:
+            logger.exception("Не удалось обработать событие создания заявки")
+
+    @staticmethod
+    def _tool_succeeded(content: str) -> bool:
+        """Удался ли вызов инструмента (ответ содержит ``ok: true``)."""
+        try:
+            data = json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            return False
+        return isinstance(data, dict) and bool(data.get("ok"))
+
+    @staticmethod
+    def _requests_lead_change(question: str) -> bool:
+        """Понять по сообщению, что клиент просит изменить или отменить заявку.
+
+        Ключевые слова грубые, но дешёвые: они лишь включают проверку, что
+        просьба действительно исполнена инструментом, а не на словах.
+        """
+        text = question.lower()
+        change_words = (
+            "заявк",
+            "запис",
+            "промокод",
+            "скидк",
+            "исправ",
+            "поправ",
+            "измен",
+            "поменя",
+            "отмен",
+            "удал",
+            "перенес",
+        )
+        return any(word in text for word in change_words)
+
+    @staticmethod
+    def _promises_change(answer: str) -> bool:
+        """Найти в ответе обещание изменить заявку."""
+        lowered = answer.lower()
+        return any(pattern in lowered for pattern in PROMISE_PATTERNS)
 
     def _remember(self, chat_id: int | str, question: str, answer: str) -> None:
         """Сохранить успешный ход диалога, не ломая ответ при ошибке диска."""
@@ -273,6 +381,8 @@ class SalesAgent:
                 {"role": "user", "content": question},
             ]
 
+            mutated = False
+            nudged = False
             for _ in range(max(1, self.settings.max_tool_rounds)):
                 response, _model = await self._completion(
                     messages, tool_specs, max_tokens=max_tokens
@@ -283,6 +393,20 @@ class SalesAgent:
                 message = response.choices[0].message
                 tool_calls = getattr(message, "tool_calls", None)
                 if not tool_calls:
+                    # Просили изменить заявку, а модель ответила обещанием?
+                    # Даём один шанс выполнить просьбу инструментом.
+                    answer_preview = getattr(message, "content", None) or ""
+                    if (
+                        not nudged
+                        and not mutated
+                        and self._requests_lead_change(question)
+                        and self._promises_change(answer_preview)
+                    ):
+                        nudged = True
+                        logger.info("Ответ содержит обещание без изменения заявки — повторяем ход")
+                        messages.append(message.model_dump(exclude_none=True))
+                        messages.append({"role": "system", "content": MUTATION_NUDGE})
+                        continue
                     return await self._finalize_answer(
                         chat_id,
                         question,
@@ -308,8 +432,12 @@ class SalesAgent:
                             arguments,
                         )
                         content = await self._execute_tool(
-                            session, call.function.name, arguments
+                            session, call.function.name, arguments, chat_id
                         )
+                        if call.function.name in LEAD_MUTATION_TOOLS and self._tool_succeeded(
+                            content
+                        ):
+                            mutated = True
                     messages.append(
                         {
                             "role": "tool",

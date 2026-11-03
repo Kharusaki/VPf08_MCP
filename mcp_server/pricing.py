@@ -65,3 +65,101 @@ def calculate_price(
         total=total,
         monthly_payment=monthly,
     )
+
+
+@dataclass(frozen=True)
+class OrderLine:
+    """Одна позиция заказа: курс и его цена с учётом скидки."""
+
+    course_id: int
+    title: str
+    base_price: int
+    discount_percent: int
+    discount_rub: int
+    total: int
+
+
+@dataclass(frozen=True)
+class OrderBreakdown:
+    """Заказ из нескольких курсов, где скидка применена ровно к одному."""
+
+    lines: tuple[OrderLine, ...]
+    promo_code: str | None
+    discounted_course_id: int | None
+    total: int
+    options: tuple[dict[str, int], ...]
+
+
+def calculate_order(
+    courses: list[tuple[int, str, int]],
+    promo_code: str = "",
+    discount_percent: int = 0,
+    apply_to_course_id: int = 0,
+) -> OrderBreakdown:
+    """Рассчитать заказ из нескольких курсов.
+
+    Промокод центра действует ровно на один курс, поэтому складывать скидку
+    ко всем позициям нельзя. Расчёт делает сервер, а не модель: так итог заказа
+    не зависит от арифметики в тексте ответа.
+
+    Args:
+        courses: список ``(id, название, цена)``.
+        promo_code: код промоакции для ответа; пустая строка — без скидки.
+        discount_percent: процент скидки; 0 — считать без скидки.
+        apply_to_course_id: курс, к которому применить скидку.
+            0 — выбрать самый дорогой (на нём скидка даёт наибольшую выгоду).
+    """
+    if not courses:
+        raise PricingError("Укажите хотя бы один курс.")
+
+    percent = int(discount_percent)
+    if not 0 <= percent <= 100:
+        raise PricingError("Скидка должна быть в диапазоне от 0 до 100%.")
+
+    # Скидка в рублях тем больше, чем дороже курс: выбираем максимальную цену.
+    if apply_to_course_id:
+        target = next(
+            (course for course in courses if course[0] == int(apply_to_course_id)),
+            None,
+        )
+        if target is None:
+            raise PricingError("Курс из заказа не найден в каталоге.")
+    else:
+        target = max(courses, key=lambda course: (course[2], -course[0]))
+
+    lines: list[OrderLine] = []
+    for course_id, title, price in courses:
+        if price <= 0:
+            raise PricingError("Цена курса должна быть положительной.")
+        apply = bool(percent) and course_id == target[0]
+        line_discount = round(price * percent / 100) if apply else 0
+        lines.append(
+            OrderLine(
+                course_id=course_id,
+                title=title,
+                base_price=int(price),
+                discount_percent=percent if apply else 0,
+                discount_rub=line_discount,
+                total=int(price) - line_discount,
+            )
+        )
+
+    # Варианты: что получится, если скидку применить к каждому из курсов.
+    options: list[dict[str, int]] = []
+    for course_id, _title, price in courses:
+        total_without = sum(int(item[2]) for item in courses)
+        options.append(
+            {
+                "course_id": course_id,
+                "order_total": total_without - round(price * percent / 100),
+                "savings": round(price * percent / 100),
+            }
+        )
+
+    return OrderBreakdown(
+        lines=tuple(lines),
+        promo_code=(promo_code or "").strip().upper() or None,
+        discounted_course_id=target[0] if percent else None,
+        total=sum(line.total for line in lines),
+        options=tuple(options),
+    )

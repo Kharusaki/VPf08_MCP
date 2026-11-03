@@ -107,6 +107,24 @@ class FakeMCP:
         return '{"ok":true,"count":1,"courses":[{"id":1,"title":"Английский с нуля"}]}'
 
 
+class LeadMCP(FakeMCP):
+    """MCP с инструментами заявки: проверяет, что агент их действительно вызывает."""
+
+    async def list_tools(self, _session: Any):
+        return [
+            SimpleNamespace(
+                name=name,
+                description=name,
+                inputSchema={"type": "object", "properties": {}},
+            )
+            for name in ("get_lead_details", "apply_promo_to_lead", "update_lead", "cancel_lead")
+        ]
+
+    async def call_tool(self, _session: Any, name: str, arguments: dict[str, Any]) -> str:
+        self.calls.append((name, arguments))
+        return '{"ok":true,"lead_id":2,"discount_percent":10,"total_price":26991}'
+
+
 def make_settings(tmp_path: Path) -> Settings:
     """Настройки без чтения реального .env."""
     return Settings(
@@ -130,6 +148,8 @@ def make_settings(tmp_path: Path) -> Settings:
         max_message_chars=1000,
         preferences_file=tmp_path / "preferences.json",
         max_continuations=2,
+        reminder_delay_seconds=120,
+        reminder_poll_seconds=15,
         log_file=tmp_path / "bot.log",
     )
 
@@ -245,4 +265,59 @@ async def test_agent_stops_after_continuation_limit(tmp_path) -> None:
     answer = await agent.run(1, "Расскажи подробно")
 
     assert answer == "Начало продолжение …"
+    assert len(fake_openai.chat.completions.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_agent_retries_promise_without_lead_change(tmp_path) -> None:
+    """Обещание «передам менеджеру» без изменения заявки не принимается."""
+    fake_openai = FakeOpenAI(
+        [
+            fake_response(content="Хорошо, я передала менеджеру, скидку исправят."),
+            fake_response(content="Готово: скидка 10% на бизнес-английский, итог 44 981 ₽."),
+        ]
+    )
+    fake_mcp = LeadMCP()
+    agent = SalesAgent(
+        settings=make_settings(tmp_path),
+        mcp_client=fake_mcp,  # type: ignore[arg-type]
+        history=HistoryStore(tmp_path / "history.json", limit=10),
+        openai_client=fake_openai,  # type: ignore[arg-type]
+    )
+
+    answer = await agent.run(1, "Поправьте мою заявку, скидку сделайте на более дорогой курс")
+
+    assert answer.startswith("Готово")
+    second_request = fake_openai.chat.completions.requests[1]["messages"][-1]
+    assert second_request["role"] == "system"
+    assert "get_lead_details" in second_request["content"]
+
+
+@pytest.mark.asyncio
+async def test_agent_accepts_answer_after_lead_change(tmp_path) -> None:
+    """Если заявка изменена инструментом — повторный ход не нужен."""
+    tool_call = SimpleNamespace(
+        id="call_promo",
+        function=SimpleNamespace(
+            name="apply_promo_to_lead", arguments='{"contact":"olga@mail.ru","promo_code":"START10"}'
+        ),
+    )
+    fake_openai = FakeOpenAI(
+        [
+            fake_response(tool_calls=[tool_call]),
+            fake_response(content="Применила скидку к бизнес-английскому, итог 44 981 ₽."),
+        ]
+    )
+    fake_mcp = LeadMCP()
+    agent = SalesAgent(
+        settings=make_settings(tmp_path),
+        mcp_client=fake_mcp,  # type: ignore[arg-type]
+        history=HistoryStore(tmp_path / "history.json", limit=10),
+        openai_client=fake_openai,  # type: ignore[arg-type]
+    )
+
+    answer = await agent.run(1, "Сделайте скидку на более дорогой курс")
+
+    assert answer.startswith("Применила")
+    assert fake_mcp.calls == [("apply_promo_to_lead", {"contact": "olga@mail.ru", "promo_code": "START10"})]
     assert len(fake_openai.chat.completions.requests) == 2

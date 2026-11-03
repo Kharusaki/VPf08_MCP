@@ -62,6 +62,10 @@ async def text_message(message: Message, app: AppContext) -> None:
     for chunk in split_text(answer):
         await message.answer(chunk)
 
+    # Таймер напоминания отсчитывается от последнего ответа бота: если клиент
+    # уйдёт без заявки, сервер пришлёт одно напоминание.
+    await app.reminders.touch(chat_id)
+
 
 @router.message(F.text.startswith("/"))
 async def unknown_command(message: Message) -> None:

@@ -76,9 +76,14 @@ async def test_mcp_end_to_end(server) -> None:
         "search_courses",
         "get_course_details",
         "calculate_course_price",
+        "calculate_order_price",
         "list_promotions",
         "search_faq",
         "create_lead",
+        "get_lead_details",
+        "update_lead",
+        "cancel_lead",
+        "apply_promo_to_lead",
     } <= names
 
     async with client.connect() as session:
@@ -137,3 +142,53 @@ async def test_mcp_end_to_end(server) -> None:
         assert lead["ok"] is True
         assert lead["created"] is True
         assert lead["lead_id"] > 0
+
+        # Заказ из двух курсов: скидка ровно на один курс, итог считает сервер.
+        raw = await client.call_tool(
+            session,
+            "calculate_order_price",
+            {"course_ids": [5, 3], "promo_code": "START10"},
+        )
+        order = json.loads(raw)
+        assert order["ok"] is True
+        assert order["discounted_course_id"] == 3
+        assert order["total"] == 44981
+        assert sum(line["discount_rub"] for line in order["lines"]) == 2999
+
+        raw = await client.call_tool(
+            session,
+            "create_lead",
+            {
+                "name": "Ольга",
+                "contact": "olga@example.test",
+                "course_id": 5,
+            },
+        )
+        assert json.loads(raw)["ok"] is True
+
+        raw = await client.call_tool(
+            session,
+            "apply_promo_to_lead",
+            {"contact": "olga@example.test", "promo_code": "START10"},
+        )
+        applied = json.loads(raw)
+        assert applied["ok"] is True
+        assert applied["discounted_course_id"] == 5
+        assert applied["order_total"] == 16191
+
+        raw = await client.call_tool(
+            session, "get_lead_details", {"contact": "olga@example.test"}
+        )
+        details = json.loads(raw)
+        assert details["count"] == 1
+        assert details["leads"][0]["title"] == "Немецкий с нуля"
+        assert details["leads"][0]["total_price"] == 16191
+
+        raw = await client.call_tool(
+            session,
+            "update_lead",
+            {"lead_id": details["leads"][0]["lead_id"], "comment": "перезвонить вечером"},
+        )
+        updated = json.loads(raw)
+        assert updated["ok"] is True
+        assert updated["comment"] == "перезвонить вечером"

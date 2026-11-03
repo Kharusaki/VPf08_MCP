@@ -126,6 +126,7 @@ async def courses_command(message: Message, app: AppContext) -> None:
 async def clear_command(message: Message, app: AppContext) -> None:
     """Очистить историю диалога текущего чата."""
     app.history.clear(message.chat.id)
+    await app.reminders.reset(message.chat.id)
     await message.answer("История этого диалога очищена. Можем начать заново.")
 
 
@@ -140,11 +141,13 @@ async def status_command(message: Message, app: AppContext) -> None:
 
     mode = app.preferences.get_answer_length(message.chat.id)
     tokens = app.preferences.max_tokens_for(message.chat.id, app.settings.max_tokens)
+    reminder = await app.reminders.status(message.chat.id)
     text = (
         "Статус бота:\n"
         f"— MCP-сервер: {mcp_status}\n"
         f"— История диалога: {app.history.count(message.chat.id)} сообщений\n"
         f"— Длина ответов: {ANSWER_LENGTHS[mode]} (до {tokens} токенов)\n"
+        f"— Напоминание о заявке: {reminder}\n"
         f"— Модель: {app.settings.default_model}"
     )
     await message.answer(text)

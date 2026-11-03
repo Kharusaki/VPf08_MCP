@@ -95,6 +95,7 @@ async def run(settings: Settings | None = None) -> None:
     app = AppContext.create(settings)
     bot = _build_bot(settings)
     dispatcher = create_dispatcher(app)
+    app.reminders.bind_sender(bot)
 
     try:
         # Недоступный MCP не мешает боту запуститься: команды /start и /help
@@ -110,6 +111,7 @@ async def run(settings: Settings | None = None) -> None:
             )
 
         await _setup_bot(bot)
+        await app.reminders.start()
         logger.info("Бот запущен. Нажмите Ctrl+C для остановки.")
         await dispatcher.start_polling(bot)
     except TelegramUnauthorizedError:
@@ -125,6 +127,7 @@ async def run(settings: Settings | None = None) -> None:
         logger.error("Нет соединения с Telegram: %s", exc)
         raise SystemExit(1)
     finally:
+        await app.reminders.close()
         await bot.session.close()
 
 

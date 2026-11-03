@@ -12,6 +12,7 @@ from .config import Settings, load_settings
 from .history import HistoryStore
 from .mcp_client import MCPClient
 from .preferences import PreferencesStore
+from .reminders import ReminderService
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,7 @@ class AppContext:
     preferences: PreferencesStore
     mcp: MCPClient
     agent: SalesAgent
+    reminders: ReminderService
 
     @classmethod
     def create(cls, settings: Settings | None = None) -> AppContext:
@@ -40,11 +42,22 @@ class AppContext:
             timeout=settings.mcp_timeout,
             read_timeout=settings.mcp_read_timeout,
         )
-        agent = SalesAgent(settings=settings, mcp_client=mcp, history=history)
+        reminders = ReminderService(
+            mcp_client=mcp,
+            delay_seconds=settings.reminder_delay_seconds,
+            poll_seconds=settings.reminder_poll_seconds,
+        )
+        agent = SalesAgent(
+            settings=settings,
+            mcp_client=mcp,
+            history=history,
+            on_lead_created=reminders.mark_lead_created,
+        )
         return cls(
             settings=settings,
             history=history,
             preferences=preferences,
             mcp=mcp,
             agent=agent,
+            reminders=reminders,
         )
